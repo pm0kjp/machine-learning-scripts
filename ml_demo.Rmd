@@ -1,0 +1,221 @@
+---
+title: "Machine Learning Project"
+author: "Joy Payton"
+date: "August 5, 2016"
+output: 
+  html_document:
+    TOC: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## The Plan
+
+First, we'll get our data (both training -- what we use to build a model, and testing -- what we use to test model effectiveness at prediction).  We'll take a little of our training data to be a validation set, then use the remainder of our training data to construct models.  Reserving some validation data will keep us from overfitting to the training data and allows for reduced variability.  This is important because of the very tiny size of our testing set.  We want to reduce variability even if it means increasing bias a bit, to ameliorate the risk of having a way-off prediction.
+
+Once we've got our data squared away, then we'll do some preliminary modeling on our training data.  We'll try linear modeling, some tree models, random forests, boosting... just getting a rough idea what seems to work.  We want to break our training data up into subgroups to do cross-validation (basically, treating various portions of our training data as unknown-outcome test data) as we do this.
+
+Once we think we've narrowed things down to a few algorithms that seem to do well, we'll ensemble or stack them together to get the most accurate prediction we can.
+
+## Getting Set up and Getting our Data
+
+Let's get some libraries that will come in handy.
+
+```{r libs}
+library(lattice)
+library(ggplot2)
+library(caret)
+library(e1071)
+library(mlbench)
+```
+
+And download our data!
+
+```{r}
+training_raw<-read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+testing<-read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+```
+
+We want to take off some of our training data as our validation set, to do a preliminary check on our model error before using our model to predict the testing data and submitting it. We can take a pretty big chunk off, since we have ample data.
+
+```{r}
+set.seed(42)
+inTrain<-createDataPartition(y=training_raw$classe, p = 0.60, list=FALSE)
+training<-training_raw[inTrain,]
+validation<-training_raw[-inTrain,]
+```
+
+## Features to use
+
+Given that we already have 160 features, the creation of new ones doesn't seem very necessary.  In fact, we should see if we can remove any that have little information to offer, either because they have close to zero variance from case to case, have lots of missing data, or because they are strongly co-linear with others features.
+
+Let's first remove any variable that has over 30% NA values across the training cases.
+
+```{r}
+na_count <-sapply(training, function(y) sum(length(which(is.na(y)))))
+which(na_count/nrow(training) >= .3)  # show our high NA's
+training<-training[,-which(na_count/nrow(training) >= .3)]
+# To keep things looking the same, do the same cleanup on validation and testing.
+validation<-validation[,-which(na_count/nrow(training) >= .3)]
+testing<-testing[,-which(na_count/nrow(training) >= .3)]
+```
+
+We should also remove the username and row number because we want this model to be applicable not just to our current user set, but to anyone who uses the equipment.
+
+```{r}
+training<-training[,-c(1,2)]
+validation<-validation[,-c(1,2)]
+testing<-testing[,-c(1,2)]
+```
+
+Let's remove near zero variation features (as found in training) from all three of our datasets.
+
+```{r}
+nsv<-nearZeroVar(training)
+training<-training[,-nsv]
+validation<-validation[,-nsv]
+testing<-testing[,-nsv]
+```
+
+This removal of variables gets us down to 57 variables, which seems much more doable as far as processor load!
+
+Still, let's take a look at correlation to see how highly correlated things seem to be:
+
+```{r}
+library(ggplot2)
+library(reshape2)
+corr<-cor(training[which(sapply(training,is.numeric))])
+qplot(x=Var1, y=Var2, data=melt(corr), fill=value, geom="tile")
+```
+
+There are some bright and dark spots with high correlation, which may point us in the direction of reducing by selection. I'm going to take a blunt force approach and remove one of each pair of features that has  strong correlation (absolute value greater than or equal to 0.75).
+
+```{r}
+corr[upper.tri(corr)]<-0  # this way I only pick one of the mirror-imaged highly correlated pair
+diag(corr)<-0 # and I don't remove the highly-correlated-with-itself group
+training<-training[,!apply(corr,2, function(x) any(abs(x)>=0.75))]
+validation<-validation[,!apply(corr,2, function(x) any(abs(x)>=0.75))]
+testing<-testing[,!apply(corr,2, function(x) any(abs(x)>=0.75))]
+```
+
+That gets us down to 33 variables, which is far more doable than the 160 we started with!
+
+We may have to pare down further by means of PCA, regularized regression, or random forest pruning.  For now, we'll start with all of them and see what that gets us.
+
+At this point, I first attempted to go ahead with LDA classification, only to discover I had a *perfect* predictor!  That made me suspicious that I was missing something very obvious, which indeed I was.  
+
+When I looked anew at the original data, saw a pattern:
+
+```{r}
+head(table(training_raw$num_window,training_raw$classe))
+tail(table(training_raw$num_window,training_raw$classe))
+head(table(training_raw$cvtd_timestamp, training_raw$classe))
+tail(table(training_raw$cvtd_timestamp, training_raw$classe))
+```
+
+The "window" is a time-series window, closely related to the timestamp, and each window contains the multiple datapoints that, together, represent a cohesive weight-lifting move.  Rookie mistake!  It's easy to perfectly predict if you know the right matchup between time of day or window ID and the activity being done.  My model wasn't really predicting anything interesting.  I'll remove the two remaining time-related values (two were already removed) to see if I can still get good results out of my model.
+
+```{r}
+training<-training[,-c(1,2)]
+validation<-validation[,-c(1,2)]
+testing<-testing[,-c(1,2)]
+```
+
+
+### Linear Discriminant Analysis	 
+
+We'll set the training control for all of our modeling attempts, and use it for our LDA model attempt.
+
+```{r}
+tctrl=trainControl(method="cv", number = 10)
+
+set.seed(42)
+lda_model<-train(classe ~ ., data=training, method="lda", trControl=tctrl)
+confusionMatrix(training$classe, predict(lda_model,training))
+```
+
+58% Accuracy. Let's see how it performs on the validation set!
+
+```{r}
+confusionMatrix(validation$classe, predict(lda_model, validation))
+```
+
+Close to 58% accuracy here as well!  At least we don't seem to be overfitting too much, but we could improve that accuracy a fair bit, I believe.
+
+
+### Random Forest
+
+``` {r}
+set.seed(42)
+rf_model<-train(classe ~ ., data=training, method="rf", trControl=tctrl)
+confusionMatrix(training$classe, predict(rf_model,training))
+```
+
+Wow, that took *forever*, but does seem to have perfect accuracy... could it be?  Let's apply the model to the validation dataset to see how it holds up.
+
+```{r}
+confusionMatrix(validation$classe, predict(rf_model,validation))
+```
+
+Not perfect, but not too shabby at almost 99% accuracy!  
+
+### Stochastic Gradient Boosting
+
+Let's try boosting.  I'll hide the results so we don't get a huge output.
+
+```{r results='hide'}
+set.seed(42)
+boost_model<-train(classe ~ ., data=training, method="gbm", trControl=tctrl)
+```
+
+What kind of accuracy do we see in training and validation?
+
+```{r}
+confusionMatrix(training$classe, predict(boost_model,training))
+confusionMatrix(validation$classe, predict(boost_model,validation))
+```
+
+Boosting does well, too, at 94% accuracy on the training data set and 92% accuracy on the validation set.  
+
+And for fun, let's do one more, Naive Bayes!
+
+### Naive Bayes
+
+```{r}
+set.seed(42)
+naiveb_model<-train(classe ~ ., data=training, method="nb", trControl=tctrl)
+confusionMatrix(training$classe, predict(naiveb_model,training))
+confusionMatrix(validation$classe, predict(naiveb_model,validation))
+```
+
+Not great -- 72% accuracy on the training set, and 71% accuracy on the validation set.
+
+At this point, we have two terrific models that are >90% accurate in both the training and validation set.  The Random Forest model is good enough to go by itself, I think, but let's see if there are any cases where Random Forest missed it but Stochastic Boosting got it right.  That will help me decide if I want to use these two models together somehow.  I'll look in validation, since the Random Forest got 100% in training!
+
+```{r}
+predictions<-data.frame(cbind(predict(rf_model,validation), predict(boost_model,validation), validation$classe))
+names(predictions)<-c("rf","boost","actual")
+predictions$rf<-as.factor(predictions$rf)
+predictions$boost<-as.factor(predictions$boost)
+predictions$actual<-as.factor(predictions$actual)
+table(predictions$rf!=predictions$actual & predictions$boost == predictions$actual)
+```
+
+Well, RF only misses 24 that Boost gets.  But the converse, where RF is right and Boost is not, is larger:
+
+```{r}
+table(predictions$rf==predictions$actual & predictions$boost != predictions$actual)
+```
+
+There doesn't seem much to gain from ensembling, when Random Forest does so well.  Because the percentage accuracy is almost the same between training and validation, I don't think I have an overfitting problem, and I anticipate the test accuracy to be over 90%.
+
+I'll go ahead and predict now.
+
+```{r}
+predict(rf_model,testing)
+```
+
+After submitting to the portal, I have an actual rate of 100%!  Yay!
+
